@@ -1,0 +1,120 @@
+---
+title: "Discrete distance neighbour illustration"
+output: html_document
+date: "2025-04-30"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggforce)
+```
+
+
+### Discretized distances neighbour visualization
+
+```{r}
+set.seed(123)
+n <- 20
+df <- tibble(
+  id = 1:n,
+  x  = runif(n),
+  y  = runif(n)
+)
+
+
+D_all <- dist(df %>% select(x,y), diag = T, upper = T) %>% 
+  as.matrix %>% as.vector
+
+n_breaks <- 7
+breaks <- quantile(D_all, probs = seq(0,1,length.out = n_breaks))
+
+
+centre_id <- 2 # reference point id
+
+cx <- df$x[centre_id]
+cy <- df$y[centre_id]
+
+
+rings <- tibble(r = breaks[-1])
+
+# each point’s discrete category relative to reference point
+df2 <- df %>% 
+  mutate(dist = sqrt((x - cx)^2 + (y - cy)^2),
+         bin = cut(dist, breaks=breaks, 
+                   labels = seq_len(n_breaks-1),
+                   include.lowest = TRUE) %>% as.integer())
+
+
+ggplot() +
+  geom_circle(data = rings, aes(x0 = cx, y0 = cy, r = r),
+              linetype = "dashed", colour = rgb(0, 0, 255, 0.4*255, maxColorValue = 255) ) +
+  geom_point(data = df, aes(x, y), size = 2) +
+  geom_text(data = filter(df2, id != centre_id),
+            aes(x, y, label = bin),
+            nudge_y = 0.015, nudge_x = 0.015, colour = "black", size = 3) +
+    geom_text(data = filter(df, id == centre_id),
+            aes(x, y),
+            label = "Reference point",
+            vjust = -1.2,     
+            hjust =  0.0,     
+            colour = "firebrick",
+            fontface = "bold",
+            size = 2) +
+  geom_point(data = filter(df, id == centre_id),
+             aes(x, y), colour = "firebrick", size = 3) +
+  coord_equal() +
+  labs(x = "x", y = "y") +
+  theme_minimal() + 
+    coord_equal(xlim = c(0,1),
+              ylim = c(0,1))  
+
+```
+
+
+
+## Gaussian kernel visualisation
+```{r}
+ref_pt <- df %>% filter(id == 2)
+
+grid_res <- 200   
+grid <- expand.grid(
+  x = seq(0,1,length.out = grid_res),
+  y = seq(0,1,length.out = grid_res)
+)
+
+sig_kernel = 0.2
+grid <- grid %>%
+  mutate(
+    dx = x - ref_pt$x,
+    dy = y - ref_pt$y,
+    z  = exp(-(dx^2 + dy^2) / (2*sig_kernel^2))
+  )
+
+ggplot() +
+  geom_raster(data = grid, aes(x, y, fill = z), interpolate = TRUE) +
+  scale_fill_distiller(                     
+    palette   = "YlOrRd",                  
+    direction = 1,
+    name = "Kernel\nvalue"
+  ) +
+  geom_point(data = df %>% filter(id != 2), aes(x, y),color = 'grey10', size = 2) +
+  geom_point(data = filter(df, id == 2),
+             aes(x, y),
+             colour = "black", size = 3, shape = 18) +
+  geom_text(data = filter(df, id == 2),
+        aes(x, y),
+        label = "Reference point",
+        vjust = -1.2,     
+        hjust =  0.0,     
+        colour = "black",
+        fontface = "bold",
+        size = 3) +
+  coord_equal(xlim = c(0,1), ylim = c(0,1)) +
+  labs(x = "x", y = "y"
+  ) +
+  theme_minimal()
+```
+

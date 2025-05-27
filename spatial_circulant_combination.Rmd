@@ -1,0 +1,666 @@
+---
+title: "Spatial og cirkulant kombination"
+output: html_document
+date: "2025-03-19"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+
+## Gaussian kernel function for points evenly spaced on a circle
+
+
+```{r}
+index_diff <- function(i,j, N) {
+  return(
+    pmin((i-j) %% N, (j-i) %% N)
+  )
+}
+
+# Distances based on arc lengths
+gauss_kernel_circ <- function(mu, sig_kernel, N) {
+  D = outer(1:N, 1:N, function(i,j) index_diff(i,j, N)*2*pi/N)
+  D_sq = D^2
+  mat = exp(-D_sq/(2*sig_kernel^2))
+  diag(mat) = 0
+  return(mat)
+}
+
+```
+
+
+
+
+## Functions to simulate from p'th order circulant GMRF
+```{r}
+circulant_matrix_base_p = function(kappa, betas, N) {
+  order = length(betas)
+  diag_entry = kappa
+  remainder = c(kappa*betas, 
+                rep(0, N-1-2*order), 
+                rev(kappa*betas))
+  return( c(diag_entry, remainder) )
+}
+
+create_circulant_precision_matrix_p = function(kappa, betas, N = 10) {
+  base = circulant_matrix_base_p(kappa, betas, N)
+  N = length(base)
+  idx = outer(seq_len(N), seq_len(N), function(i,j) ((j-i) %% N) +1)  # Definition 2.4 Rue & Held
+  matrix_out = matrix(base[idx], nrow = N)
+  return (matrix_out)
+}
+
+simulate_circulant_GMRF = function(mu, precision_mat, nsim = 1) {
+  Q = precision_mat
+  N = nrow(Q)
+  Sigma = solve(Q) 
+  out = MASS::mvrnorm(n = nsim, mu = rep(mu, N), Sigma = Sigma)
+  return(out)
+}
+
+```
+
+
+
+## Estimating circulant model parameters via kernel model specification
+
+- We simulate from a circulant model 
+- Recover kernel based model parameters from simulated data
+- Convert kernel model parameter estimates to circulant model parameter estimates
+
+### kernel model log-likelihood
+```{r}
+log_like_kernel_single <- function(V_vec, W, W_tilde, eigenvals, rowsums, mu, phi, lambda) {
+  N = length(V_vec)
+  v_ = V_vec-mu 
+  
+  
+  term1 = -N/2*log(lambda)
+  term2 = 1/2*sum(log(rowsums))
+  term3 = 1/2*sum(log(1 - phi*eigenvals))
+  term4 = -N/2*log(2*pi)
+  term5 = -1/(2*lambda)*sum(v_^2*rowsums)
+  term6 = phi/(2*lambda)*(v_%*%W%*%v_)
+  
+  return(term1 + term2 + term3 + term4 + term5 + term6)
+}
+
+log_like_kernel <- function(V, W, W_tilde, eigenvals, rowsums, mu, phi, lambda){
+  apply(V, 1, function(x) log_like_kernel_single(x, W, W_tilde, eigenvals, rowsums, mu, phi, lambda)) %>% 
+    sum %>% return
+}
+```
+
+### Parameter estimation functions for kernel model
+```{r}
+# mu_est <- mean(V)
+
+
+quad_terms_single_v <- function(v, mu, phi, W, rowsums) { 
+  v <- v - mu
+  term1 <- sum(v^2*rowsums)
+  term2 <- phi* (v%*%W%*%v)
+  return(term1 - term2)
+}
+
+lam_estimate <- function(v, mu, phi, W, rowsums) {
+  m <- nrow(v)
+  N <- ncol(v)
+  quad_terms <- apply(v, 1, function(v) quad_terms_single_v(v, mu, phi, W, rowsums))
+  return (sum(quad_terms) / (N*m))
+}
+
+# eigenvalues of W_tilde - calculate once 
+score_phi <- function(phi, v, mu, eigenvals_W_tilde, W, rowsums) {
+  N <- ncol(v)
+  m <- nrow(v)
+  term1 <- -m/2 * sum( eigenvals_W_tilde/(1-phi*eigenvals_W_tilde))
+  
+  sum_quads_denom = sum(apply(v, 1, function(v_) quad_terms_single_v(v_, mu, phi, W, rowsums)))
+  sum_quads_numer = sum(apply(v, 1, function(v_) {
+    v = v_-mu
+    return(v%*%W%*%v)
+  }))
+  term2 <- N*m/(2*sum_quads_denom) *sum_quads_numer
+  return(term1 + term2)
+}
+
+# res <- uniroot(
+#   f = function(phi) score_phi(phi, V, mu_est, lambdas, W, rowsums),
+#   lower = -1,
+#   upper = 0.99
+# )
+# 
+# phi_est <- res$root
+# lam_est <- lam_estimate(V, mu_est, phi_est, W, rowsums)
+# 
+# c('phi_est'=phi_est, 'lambda_est' = lam_est, 'mu_est' = mu_est)
+```
+
+
+- Regn likelihood for parametre estimeret givet et bestemt sig_kernel.
+### Varying sigma (for kernel), calculating log like for each and choosing MLE
+```{r}
+sigmas_kernel = seq(0.01, 1, by = 0.01)
+n_sigmas = length(sigmas_kernel)
+
+N <- 20
+set.seed(123)
+mu_true = 0
+kappa_true = 10
+betas = c(-0.18, -0.12, -0.06, -0.03)
+Q = create_circulant_precision_matrix_p(kappa_true, betas, N = N)
+V = simulate_circulant_GMRF(mu_true, Q, nsim = 500)
+
+mu_est = mean(V)
+
+lls = numeric(length(sigmas_kernel))
+
+for (i in 1:n_sigmas) {
+  sigma = sigmas_kernel[i]
+  
+  W = gauss_kernel_circ(mu_est, sigma, N)
+  rowsums <- rowSums(W)
+  c <- rowsums[1]
+  
+  W_tilde = (1 / c) * W
+  lambdas <- eigen(W_tilde)$values
+  
+  res <- uniroot(
+      f = function(phi)
+        score_phi(phi, V, mu_est, lambdas, W, rowsums),
+      lower = -1,
+      upper = 0.99
+    )
+  phi_est <- res$root
+  lam_est <- lam_estimate(V, mu_est, phi_est, W, rowsums)
+  ll = log_like_kernel(V, W, W_tilde, lambdas, rowsums, mu_est, phi_est, lam_est)
+  
+  lls[i] <- ll
+}
+
+
+## endelige estimater ud fra max likelihood 
+sigma_max_ll = sigmas_kernel[which.max(lls)]
+
+W = gauss_kernel_circ(mu_est, sigma_max_ll, N)
+rowsums <- rowSums(W)
+c <- rowsums[1]
+
+W_tilde = (1 / c) * W
+lambdas <- eigen(W_tilde)$values
+
+res <- uniroot(
+    f = function(phi)
+      score_phi(phi, V, mu_est, lambdas, W, rowsums),
+    lower = -1,
+    upper = 0.99
+  )
+phi_est <- res$root
+lam_est <- lam_estimate(V, mu_est, phi_est, W, rowsums)
+
+
+```
+
+```{r}
+plot(sigmas_kernel, lls, type = 'l', ylab = 'log-likelihood', xlab = expression(sigma))
+abline(v = sigma_max_ll, lty = 'dashed', col = 'red')
+legend('topright', legend = expression(sigma['*']),
+       lty = 'dashed', col = 'red', bty = 'n')
+```
+
+
+Konvertering til cirkulant model estimater.
+```{r}
+kappa_est <- c/lam_est
+
+beta_est <- numeric(N/2)
+for (k in 1:(N/2)) {
+  beta_est[k] = -(phi_est/c)* W[1,k+1]  # samme
+}
+circ_kernel = gauss_kernel_circ(5, sig_kernel = sigma_max_ll, N)[1,2:(N/2 +1)]
+```
+
+
+```{r}
+# define a fine grid of k’s from 1 to N
+k_grid1 <- seq(1, N/2, length.out = 500) # only need this part later
+k_grid2 <- seq(N/2, N, length.out = 500)
+k_grid = c(k_grid1, k_grid2)
+
+# map to angles in [0,2*pi]
+theta_grid <- (k_grid) * 2 * pi / N
+
+# circular distance from 0
+d_grid <- pmin(theta_grid, 2*pi - theta_grid)
+
+# continuous Gaussian kernel scaled by phi_est/c
+kernel_cont <- (phi_est/c) * exp(-d_grid^2 / (2 * sigma_max_ll^2))
+
+```
+
+
+Plot with true betas and estimated betas from kernel
+```{r}
+# beta_true <- c(beta1_true, beta2_true, beta3_true, rep(0, N/2 - 3))
+# beta_true <- c(beta1_true, beta2_true, rep(0, N/2 - 2))
+# beta_true <- c(beta1_true, beta2_true, beta3_true, beta4_true, rep(0, N/2 - 4))
+beta_true <- c(betas, rep(0, N/2 - length(betas)))
+
+plot(-beta_est, 
+     ylim = c(min(0, min(-beta_est)), max(max(-beta_est), -beta_true)),
+     pch = 3, 
+     lwd = 1.5,
+     xlab = 'k', 
+     ylab = latex2exp::TeX(r'($-\beta_k$)'))
+
+points(-beta_true, col = 'red', pch = 2, lwd = 1.5)
+lines(k_grid1, kernel_cont[1:500], lty = 'dashed')  # continous interpolation
+
+legend("topright", 
+       legend = c("Estimate", "True value", "Gaussian kernel \n(scaled appropriately)"),
+       col = c("black", "red", "black"),
+       pch = c(3, 2, NA),
+       lty = c(NA, NA, "dashed"),
+       lwd = c(1.5, 1.5, 1.5),
+       bty = "n",
+       cex = 0.9)
+```
+
+
+
+
+## Kernel model with relation to circulant model
+
+
+Functions to simulate from kernel model GMRF
+```{r}
+create_params_and_matrices <- function(lam, phi, x_coords, y_coords, sig_kernel) {
+  n_points = length(x_coords)
+  D <- dist(cbind(x_coords, y_coords), diag = T, upper = T) %>% as.matrix
+  W <- exp(-D^2/(2*sig_kernel^2))
+  diag(W) = 0
+  
+  rowsums <- rowSums(W)
+  W_tilde <- sweep(W, 1, FUN = '/', STATS = rowsums)
+  
+  sigma2s <- lam/rowsums
+
+  Q <- diag(1/sigma2s) %*% (diag(n_points) - phi*W_tilde)
+  
+  return(list(
+    'D' = D,
+    'W_tilde' = W_tilde,
+    'W' = W,
+    'rowsums' = rowsums,
+    'phi' = phi,
+    'Q' = Q
+  ))
+  
+}
+
+simulate_GMRF = function(precision_mat, nsim = 1, mu = rep(0, nrow(precision_mat))) {
+  Q = precision_mat
+  N = nrow(Q)
+  Sigma = solve(Q) 
+  out = MASS::mvrnorm(n = nsim, mu = mu, Sigma = Sigma)
+  return(out)
+}
+```
+
+Points simulated in a grid, uniform at random
+```{r}
+set.seed(123)
+N = 20
+m = 1000
+x_coords <- runif(N)
+y_coords <- runif(N)
+```
+
+
+```{r}
+sig_kernel = 0.2
+phi = 0.95
+lam = 1
+
+params_matrices <- create_params_and_matrices(lam, phi, x_coords, y_coords, sig_kernel)
+Q <- params_matrices$Q
+V <- simulate_GMRF(Q, nsim = m)
+
+
+phi_true <- params_matrices$phi
+W <- params_matrices$W
+W_tilde <- params_matrices$W_tilde
+lambdas <- eigen(W_tilde)$values
+rowsums <- params_matrices$rowsums
+
+```
+
+
+Discretized distances:
+```{r}
+D = params_matrices$D
+
+D_vec <- as.vector(D)
+
+n_breaks <- 7
+breaks <- quantile(D_vec, probs = seq(0, 1, length.out = n_breaks))
+
+
+labels_vec <- cut(D_vec, breaks = breaks, include.lowest = T, labels = 1:(n_breaks-1))
+labels_numeric <- as.integer(labels_vec)
+
+labels_matrix <- matrix(labels_numeric, nrow = nrow(D), ncol = ncol(D))
+diag(labels_matrix) = 0
+```
+
+Covariance at distance k and variance (for all diagonal entries)
+```{r}
+mean_est = mean(V)
+
+cov_at_dist_k_single_v = function(v_vec, S_k_unique, mean_est) {
+  summed_vals = apply(S_k_unique, 1, function(idx) {
+    i = idx[1]
+    j = idx[2]
+    v_i = v_vec[i] 
+    v_j = v_vec[j]
+    (v_i-mean_est)*(v_j-mean_est)
+  }) %>% sum
+  return(1/nrow(S_k_unique) * summed_vals)
+}
+
+cov_at_dist_k <- function(V, k, distance_labels_matrix) {
+  if (k == 0) {
+    #var_est = apply(V, 2, var) %>% mean
+    var_est = var(as.vector(V))
+    return(var_est)
+  }
+  
+  m = nrow(V)
+  S_k = which(distance_labels_matrix == k, arr.ind = T)
+  S_k_unique = S_k[S_k[, "row"] < S_k[, "col"], ]
+  
+  summed_over_v_vecs = sum(apply(V, 1, function(v_) {
+    cov_at_dist_k_single_v(v_, S_k_unique, mean_est)
+  }))
+  return(1/m*summed_over_v_vecs)
+}
+
+```
+
+```{r}
+unique_labels <- 0:(n_breaks-1)
+cov_by_label <- sapply(unique_labels, function(k) cov_at_dist_k(V, k, labels_matrix))
+names(cov_by_label) <- unique_labels
+
+
+Sigma_hat = matrix(NA, nrow = N, ncol = N)
+for (k in unique_labels) {
+  Sigma_hat[labels_matrix == k] <- cov_by_label[as.character(k)]
+}
+Q_est = solve(Sigma_hat)
+```
+
+
+
+
+Averaging partial correlations from discretized distances
+
+```{r}
+p <- n_breaks-1
+
+beta_est = numeric(p)
+beta_est_median = numeric(p)
+beta_est_std = numeric(p)
+cond_corr_theo = numeric(p)
+cond_corr_theo_std = numeric(p)
+
+
+for (k in 1:p) {
+  indices_bin_k <- which(labels_matrix == k, arr.ind = TRUE)
+  unique_indices_bin_k <- indices_bin_k[indices_bin_k[,1] < indices_bin_k[,2], ]
+  rho_vals_k <- apply(unique_indices_bin_k, 1, function(idx) {
+    i <- idx[1]
+    j <- idx[2]
+    - Q_est[i, j] / sqrt(Q_est[i, i] * Q_est[j, j])
+  })
+  beta_est[k] <- -mean(rho_vals_k)
+  beta_est_median[k] <- -median(rho_vals_k)
+  beta_est_std[k] <- sd(rho_vals_k)
+  
+  # theoretical values
+  corr_vals_k <-  apply(unique_indices_bin_k, 1, function(idx) {
+    i <- idx[1]
+    j <- idx[2]
+    phi*W[i, j] / sqrt(rowsums[i] * rowsums[j])
+  })
+  cond_corr_theo[k] <- mean(corr_vals_k)
+  cond_corr_theo_std[k] <- sd(corr_vals_k)
+}
+beta_est
+```
+
+
+```{r}
+
+# For each bin label, calculate the median distance of all corresponding (unique) pairs.
+medians_by_bin <- sapply(1:(n_breaks-1), function(k) {
+  idx <- which(labels_matrix == k, arr.ind = TRUE)
+  idx_unique <- idx[idx[, "row"] < idx[, "col"], ]
+  
+  d_vals <- D[idx_unique]
+  median(d_vals)
+})
+
+```
+
+Plot of scaled gaussian kernel and corresponding betas from discretized distances:
+
+```{r}
+gauss_kernel <- function(x) return(exp(-(x^2)/(2*sig_kernel^2)))
+
+avg_row_sum <- mean(rowsums)
+mean_kappa_est = mean(diag(Q_est))
+
+# scaling like with the kernel-model on the circle, but here using avg. row sum
+scaled_gauss_kernel <- function(x) (return((phi/avg_row_sum)*gauss_kernel(x)))
+
+midpoints <- medians_by_bin
+
+plot(midpoints, -beta_est, pch = 2, ylim = c(min(-beta_est) - 0.025, max(-beta_est) + 0.12), 
+     xlab = 'Distance',
+     ylab = '',
+     lwd = 1.5)
+
+points(midpoints, cond_corr_theo, pch = 4, col = 'red', lwd = 1.5)
+
+arrows(midpoints, -beta_est - beta_est_std, 
+       midpoints, -beta_est + beta_est_std,
+       angle = 90, code = 3, length = 0.05, col = "black", lty = 'dashed', lwd = 1)
+
+
+
+curve(scaled_gauss_kernel, add = TRUE, from = midpoints[1], to = midpoints[p], 
+      col ='blue', lwd = 1.5)
+
+
+
+legend('topright', pch = c(2, NA, 4), 
+       col = c('black', 'blue', 'red'),
+       lty = c(NA, 1, NA),
+       lwd = c(1.5, 1.5, 1.5),
+       legend = c('Estimated betas', 'Scaled kernel', 'Avg. from underlying kernel'),
+       cex = 0.8,
+       bty = 'n')
+title(paste0('N = ', N, ', m = ', m), adj =0, cex.main = 1, line = 0.2)
+```
+
+
+
+
+### Plot with varying N and m
+```{r}
+set.seed(4)
+
+Ns <- c(15, 20, 25, 30)
+ms <- c(1000)
+combs <- expand_grid(Ns, ms)
+
+
+###
+# define a 3×2 layout matrix 
+# cells 1–4 are four panels
+# cell 5 (shown twice) spans both columns on the bottom row for the legend.
+layout(
+  mat = matrix(c(1,2,
+                 3,4,
+                 5,5),
+                  nrow = 3,
+                  byrow = TRUE),
+  heights = c(1, 1, 0.2)
+)
+
+par(mar = c(4, 4, 2, 1))
+
+
+
+sig_kernel = 0.2
+phi = 0.95
+lam = 1
+
+for (i in 1:nrow(combs)) {
+  N <- combs$Ns[i]
+  m <- combs$ms[i]
+  
+  ## points 
+  x_coords <- runif(N)
+  y_coords <- runif(N)
+  
+  ## matrices
+  params_matrices <- create_params_and_matrices(lam, phi, x_coords, y_coords, sig_kernel)
+  Q <- params_matrices$Q
+  V <- simulate_GMRF(Q, nsim = m)
+  
+  phi_true <- params_matrices$phi
+  W <- params_matrices$W
+  W_tilde <- params_matrices$W_tilde
+  lambdas <- eigen(W_tilde)$values
+  rowsums <- params_matrices$rowsums
+  
+  ## Distances
+  D = params_matrices$D
+  D_vec <- as.vector(D)
+  
+  n_breaks <- 7
+  breaks <- quantile(D_vec, probs = seq(0, 1, length.out = n_breaks))
+  
+  labels_vec <- cut(D_vec, breaks = breaks, include.lowest = T, labels = 1:(n_breaks-1))
+  labels_numeric <- as.integer(labels_vec)
+  
+  labels_matrix <- matrix(labels_numeric, nrow = nrow(D), ncol = ncol(D))
+  diag(labels_matrix) = 0
+  
+  
+  ## Precision matrix estimate
+  unique_labels <- 0:(n_breaks-1)
+  cov_by_label <- sapply(unique_labels, function(k) cov_at_dist_k(V, k, labels_matrix))
+  names(cov_by_label) <- unique_labels
+  
+  Sigma_hat = matrix(NA, nrow = N, ncol = N)
+  for (k in unique_labels) {
+    Sigma_hat[labels_matrix == k] <- cov_by_label[as.character(k)]
+  }
+  Q_est = solve(Sigma_hat)
+  
+  ## Beta estimates
+  p <- n_breaks-1
+
+  beta_est = numeric(p)
+  beta_est_median = numeric(p)
+  beta_est_std = numeric(p)
+  cond_corr_theo = numeric(p)
+  cond_corr_theo_std = numeric(p)
+  
+  
+  for (k in 1:p) {
+    indices_bin_k <- which(labels_matrix == k, arr.ind = TRUE)
+    unique_indices_bin_k <- indices_bin_k[indices_bin_k[,1] < indices_bin_k[,2], ]
+    rho_vals_k <- apply(unique_indices_bin_k, 1, function(idx) {
+      i <- idx[1]
+      j <- idx[2]
+      - Q_est[i, j] / sqrt(Q_est[i, i] * Q_est[j, j])
+    })
+    beta_est[k] <- -mean(rho_vals_k)
+    beta_est_median[k] <- -median(rho_vals_k)
+    beta_est_std[k] <- sd(rho_vals_k)
+    
+    # theoretical values
+    corr_vals_k <-  apply(unique_indices_bin_k, 1, function(idx) {
+      i <- idx[1]
+      j <- idx[2]
+      phi*W[i, j] / sqrt(rowsums[i] * rowsums[j])
+    })
+    cond_corr_theo[k] <- mean(corr_vals_k)
+    cond_corr_theo_std[k] <- sd(corr_vals_k)
+  }
+  
+  ## bin midpoints
+  medians_by_bin <- sapply(1:(n_breaks-1), function(k) {
+    idx <- which(labels_matrix == k, arr.ind = TRUE)
+    idx_unique <- idx[idx[, "row"] < idx[, "col"], ]
+    
+    d_vals <- D[idx_unique]
+    
+    median(d_vals)
+  })
+
+  gauss_kernel <- function(x) return(exp(-(x^2)/(2*sig_kernel^2)))
+
+  avg_row_sum <- mean(rowsums)
+  mean_kappa_est = mean(diag(Q_est))
+  
+  scaled_gauss_kernel <- function(x) (return(phi/avg_row_sum*gauss_kernel(x)))
+  
+  
+  midpoints <- medians_by_bin
+  
+  plot(midpoints, -beta_est, pch = 2, ylim = c(min(-beta_est) - 0.08, max(-beta_est) + 0.12), 
+       xlab = 'Distance',
+       ylab = '',
+       lwd = 1.5)
+  
+  points(midpoints, cond_corr_theo, pch = 4, col = 'red', lwd = 1.5)
+  
+  arrows(midpoints, -beta_est - beta_est_std, 
+         midpoints, -beta_est + beta_est_std,
+         angle = 90, code = 3, length = 0.05, col = "black", lty = 'dashed', lwd = 1)
+  
+  
+  curve(scaled_gauss_kernel, add = TRUE, from = midpoints[1], to = midpoints[p], 
+        col ='blue', lwd = 1.5)
+  title(paste0('N = ', N, ', m = ', m), adj =0, cex.main = 1, line = 0.2)
+  
+}
+# legend seperately
+par(mar = c(0, 0, 0, 0))
+plot.new()
+legend("center",
+       legend = c("Estimated betas",
+                  "Gaussian kernel (scaled)",
+                  "Avg. kernel-based cond. correlations"),
+       pch = c(2,   NA,  4),
+       lty = c(NA,  1,   NA),
+       col = c("black","blue","red"),
+       lwd = c(1.5, 1.5, 1.5),
+       horiz = TRUE,
+       bty = "n",
+       cex = 0.9,
+       x.intersp = 0.1
+)
+```
+

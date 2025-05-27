@@ -1,0 +1,262 @@
+---
+title: "Spatial model simulation"
+output: html_document
+date: "2025-03-05"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+ -- Note that lambda (lam) corresponds to nu in the text. --
+
+## Data simulation
+```{r}
+
+create_params_and_matrices <- function(lam, phi, x_coords, y_coords, sig_kernel = 0.1) {
+  n_points = length(x_coords)
+  D <- dist(cbind(x_coords, y_coords), diag = T, upper = T) %>% as.matrix
+  W <- exp(-D^2/(2*sig_kernel^2))
+  diag(W) = 0 
+  
+  rowsums <- rowSums(W)
+  W_tilde <- sweep(W, 1, FUN = '/', STATS = rowsums)
+  
+  sigma2s <- lam/rowsums
+
+  Q <- diag(1/sigma2s) %*% (diag(n_points) - phi*W_tilde)
+  
+  return(list(
+    'W_tilde' = W_tilde,
+    'W' = W,
+    'rowsums' = rowsums,
+    'phi' = phi,
+    'Q' = Q
+  ))
+  
+}
+
+simulate_GMRF = function(precision_mat, nsim = 1, mu = rep(0, nrow(precision_mat))) {
+  Q = precision_mat
+  N = nrow(Q)
+  Sigma = solve(Q) 
+  out = MASS::mvrnorm(n = nsim, mu = mu, Sigma = Sigma)
+  return(out)
+}
+```
+
+```{r}
+set.seed(124)
+N <- 100
+x_coords <- runif(N)
+y_coords <- runif(N)
+params_matrices <- create_params_and_matrices(lam = 3, phi = 0.9, 
+                                              x_coords = x_coords, 
+                                              y_coords = y_coords)
+Q <- params_matrices$Q
+V <- simulate_GMRF(Q)
+phi_true <- params_matrices$phi
+W <- params_matrices$W
+W_tilde <- params_matrices$W_tilde
+lambdas <- eigen(W_tilde)$values
+rowsums <- params_matrices$rowsums
+
+
+plot(V, type = 'l')
+```
+
+ Precision_i: 1/sigma_i^2 = W_i+/lambda -> lavere lambda, højere præcision
+ 
+ 
+## Estimation - score equations
+```{r}
+quad_terms <- function(v, phi, W, rowsums) { # v should be with µ subtracted
+  term1 <- sum(v^2*rowsums)
+  term2 <- phi* (v%*%W%*%v)
+  return(term1 - term2)
+}
+
+lam_estimate <- function(v, phi, W, rowsums) {
+  N <- length(v)
+  return (quad_terms(v, phi, W, rowsums) / N)
+}
+
+# eigenvalues of W_tilde - calculate once 
+score_phi <- function(phi, v, eigenvals_W_tilde, W, rowsums) {
+  N <- length(v)
+  term1 <- -1/2 * sum( eigenvals_W_tilde/(1-phi*eigenvals_W_tilde))
+  term2 <- N/(2*quad_terms(v, phi, W, rowsums)) * v%*%W%*%v
+  return(term1 + term2)
+}
+
+res <- uniroot(
+  f = function(phi) score_phi(phi, V, lambdas, W, rowsums),
+  lower = 0,
+  upper = 0.99
+)
+
+phi_est <- res$root
+lam_est <- lam_estimate(V, phi_est, W, rowsums)
+
+c('phi_est'=phi_est, 'lambda_est' = lam_est)
+```
+
+
+### Visualization of score function
+```{r}
+scores <- Vectorize(score_phi, 'phi')(seq(-2, 0.99, by = 0.01), V, lambdas, W, rowsums)
+plot(seq(-2,0.99, by = 0.01), scores, type = 'l', ylim = c(-10, 6))
+abline(h = 0, lty = 'dashed', col = 'red')
+```
+ 
+## Estimation with multiple realizations - numerical
+
+```{r}
+set.seed(123)
+N <- 50
+x_coords <- runif(N)
+y_coords <- runif(N)
+params_matrices <- create_params_and_matrices(lam = 3, phi = 0.5, 
+                                              x_coords = x_coords, 
+                                              y_coords = y_coords, sig_kernel = 0.1)
+Q <- params_matrices$Q
+V <- simulate_GMRF(Q, nsim = 10, mu = rep(5, nrow(Q)))
+phi_true <- params_matrices$phi
+W <- params_matrices$W
+W_tilde <- params_matrices$W_tilde
+lambdas <- eigen(W_tilde)$values
+rowsums <- params_matrices$rowsums
+```
+
+```{r}
+
+# mu_est <- mean(V)
+
+
+quad_terms_single_v <- function(v, mu, phi, W, rowsums) { 
+  v <- v - mu
+  term1 <- sum(v^2*rowsums)
+  term2 <- phi* (v%*%W%*%v)
+  return(term1 - term2)
+}
+
+lam_estimate <- function(v, mu, phi, W, rowsums) {
+  m <- nrow(v)
+  N <- ncol(v)
+  quad_terms <- apply(v, 1, function(v) quad_terms_single_v(v, mu, phi, W, rowsums))
+  return (sum(quad_terms) / (N*m))
+}
+
+# eigenvalues of W_tilde - calculate once 
+score_phi <- function(phi, v, mu, eigenvals_W_tilde, W, rowsums) {
+  N <- ncol(v)
+  m <- nrow(v)
+  term1 <- -m/2 * sum( eigenvals_W_tilde/(1-phi*eigenvals_W_tilde))
+  
+  sum_quads_denom = sum(apply(v, 1, function(v_) quad_terms_single_v(v_, mu, phi, W, rowsums)))
+  sum_quads_numer = sum(apply(v, 1, function(v_) {
+    v = v_-mu
+    return(v%*%W%*%v)
+  }))
+  term2 <- N*m/(2*sum_quads_denom) *sum_quads_numer
+  return(term1 + term2)
+}
+
+# res <- uniroot(
+#   f = function(phi) score_phi(phi, V, mu_est, lambdas, W, rowsums),
+#   lower = -1,
+#   upper = 0.99
+# )
+# 
+# phi_est <- res$root
+# lam_est <- lam_estimate(V, mu_est, phi_est, W, rowsums)
+# 
+# c('phi_est'=phi_est, 'lambda_est' = lam_est, 'mu_est' = mu_est)
+```
+
+```{r}
+est_params <- function(V, eigenvals, W, rowsums) {
+  mu_est <- mean(V)
+  
+  res <- uniroot(
+    f = function(phi) score_phi(phi, V, mu_est, eigenvals, W, rowsums),
+    lower = -1,
+    upper = 0.99
+  )
+  phi_est <- res$root
+  lam_est <- lam_estimate(V, mu_est, phi_est, W, rowsums)
+  
+  return(list('phi_est' = phi_est, 
+              'lam_est' = lam_est, 
+              'mu_est' = mu_est))
+  
+}
+
+est_params(V, lambdas, W, rowsums)
+```
+
+
+### Visualization of score function
+```{r}
+scores <- Vectorize(score_phi, 'phi')(seq(-0.01, 0.99, length.out = 100), V, 5, lambdas, W, rowsums)
+plot(seq(-0.01, 0.99, length.out = 100), scores, type = 'l', ylim = c(-10, 10))
+abline(h = 0, lty = 'dashed', col = 'red')
+```
+
+
+
+## Histograms for different values of m
+```{r}
+set.seed(123)
+
+par(mfrow = c(3, 2))
+
+N <- 50
+x_coords <- runif(N)
+y_coords <- runif(N)
+params_matrices <- create_params_and_matrices(lam = 3, phi = 0.5, 
+                                              x_coords = x_coords, 
+                                              y_coords = y_coords, sig_kernel = 0.1)
+Q <- params_matrices$Q
+phi_true <- params_matrices$phi
+W <- params_matrices$W
+W_tilde <- params_matrices$W_tilde
+lambdas <- eigen(W_tilde)$values
+rowsums <- params_matrices$rowsums
+
+N_trials <- 1000
+ms <- c(25, 100, 250)
+for (m in ms) {
+  res_phi <- numeric(N_trials)
+  res_lam <- numeric(N_trials)
+  
+  for (t in 1:N_trials) {
+    V <- simulate_GMRF(Q, nsim = m) 
+    param_ests <- est_params(V, lambdas, W, rowsums)
+    res_phi[t] <- param_ests$phi_est
+    res_lam[t] <- param_ests$lam_est
+  }
+  if (m == min(ms)) {
+    lam_min = min(res_lam) - 0.02
+    lam_max = max(res_lam) + 0.02
+    phi_min = min(res_phi) - 0.02
+    phi_max = max(res_phi) + 0.02
+  }
+  
+  
+  hist(res_phi, breaks = 25, main = paste0('m = ', m), 
+       xlab = latex2exp::TeX(r'($\phi$)'),
+       xlim = c(phi_min, phi_max)
+       )
+  abline(v =0.5, lty = 'dashed', col = 'red', lwd = 1.5)
+  
+  hist(res_lam, breaks = 25, main = paste0('m = ', m), 
+       xlab = latex2exp::TeX(r'($\nu$)'),
+       xlim = c(lam_min, lam_max)
+       )
+  abline(v = 3, lty = 'dashed', col = 'red', lwd = 1.5)
+}
+```

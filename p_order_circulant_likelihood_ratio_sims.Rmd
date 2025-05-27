@@ -1,0 +1,351 @@
+---
+title: "Circulant likelihood ratio simulation study"
+output: html_document
+date: "2025-04-28"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rootSolve)
+```
+
+## Simulating from p'th order model
+```{r}
+circulant_matrix_base_p = function(kappa, betas, N) {
+  order = length(betas)
+  diag_entry = kappa
+  remainder = c(kappa*betas, 
+                rep(0, N-1-2*order), 
+                rev(kappa*betas))
+  return( c(diag_entry, remainder) )
+}
+
+create_circulant_precision_matrix_p = function(kappa, betas, N = 10) {
+  base = circulant_matrix_base_p(kappa, betas, N)
+  N = length(base)
+  idx = outer(seq_len(N), seq_len(N), function(i,j) ((j-i) %% N) +1)  # Definition 2.4 Rue & Held
+  matrix_out = matrix(base[idx], nrow = N)
+  return (matrix_out)
+}
+
+simulate_circulant_GMRF = function(mu, precision_mat, nsim = 1) {
+  Q = precision_mat
+  N = nrow(Q)
+  Sigma = solve(Q) 
+  out = MASS::mvrnorm(n = nsim, mu = rep(mu, N), Sigma = Sigma)
+  return(out)
+}
+```
+
+
+## Numerical estimation
+```{r}
+R_val <- function(v, mu, k) {
+  v_ = v- mu
+  shifted_indices <- ((0:(N-1) + k ) %% N) + 1
+  return( sum(v_ * v_[shifted_indices]) ) 
+}
+
+R_val_vec <- Vectorize(R_val, 'k')
+
+
+kappa_hat_numerical <- function(beta_vec, mu, V) {
+  m = nrow(V)
+  p = length(beta_vec)
+  sum_squares <- sum(apply(V, 1, function(x) sum((x-mu)^2)))
+  R_vals = apply(V, 1, function(x) R_val_vec(x, mu, 1:p))
+  denom = sum_squares + 2*sum(beta_vec*R_vals)
+  return(N*m/denom)
+}
+
+score_beta_numerical <- function(beta_vec, V, mu) {
+  N <- ncol(V)
+  m <- nrow(V)
+  p <- length(beta_vec)
+  f <- numeric(p)
+  
+  kappa_est = kappa_hat_numerical(beta_vec, mu, V)
+  
+  for (k in 1:p) {
+    
+    j_seq = 0:(N-1)
+    
+    term1 <- m*sum(sapply(j_seq, function(j) {
+      numerator = cos(2*pi*j*k/N)
+      cosines_denom_j = cos(2*pi*j*(1:p)/N)
+      denom = 1 + 2*sum(beta_vec*cosines_denom_j)
+      
+      return(numerator/denom)
+    }))
+    
+    # R_val_k = R_val(v, mu, k)
+    R_val_k = sum(apply(V, 1, function(x) R_val(x, mu, k)))
+    term2 = kappa_est*R_val_k
+    
+    f[k] <- term1 - term2
+  }
+  return(f)
+}
+
+solve_params_numerical <- function(initial_guess_betas, V) {
+  mu_est <- mean(V)
+  solution <- multiroot(f = function(bet) score_beta_numerical(bet, V, mu_est), start = initial_guess_betas)
+  beta_est_num <- solution$root
+  kappa_est_num = kappa_hat_numerical(beta_est_num, mu_est, V)
+  
+  return(
+    list('kappa_est' = kappa_est_num,
+         'beta_est' = beta_est_num,
+         'mu_est' = mu_est)
+  )
+}
+```
+
+
+## Analytical estimation
+```{r}
+# A function to cyclically shift a vector by 'shift_by' positions to the left
+cyclic_shift <- function(vec, shift_by) {
+  n <- length(vec)
+  if (shift_by == 0) {
+    return(vec)
+  }
+  # shift by 1: [2:n, 1].  
+  # shift by 2: [3:n, 1:2].
+  return(c(vec[(shift_by+1):n], vec[1:shift_by]))
+}
+
+
+# Cycle-average covariance from ONE vector of length N
+cov_cycle_one <- function(x) {
+  N <- length(x)
+  j_seq <- 0:(N-1)
+  outer_prods <- lapply(j_seq, function(j) {
+    x_shift <- cyclic_shift(x, j)
+    return(outer(x_shift, x_shift))
+  })
+  return(Reduce("+", outer_prods) / N)
+}
+
+
+# Handle M realizations
+cov_cycle_multi <- function(V) {
+  # V is m x N
+  m <- nrow(V)
+  N <- ncol(V)
+  
+  cov_list <- vector("list", m)
+  for (i in seq_len(m)) {
+    x_i <- V[i, ]  # one realization
+    cov_list[[i]] <- cov_cycle_one(x_i)
+  }
+  Sigma_est <- Reduce("+", cov_list) / m  
+  return(Sigma_est)
+}
+
+solve_params_analytical <- function(V, p) {
+  Sigma_est <- cov_cycle_multi(V)
+  Q_est <- solve(Sigma_est)
+  kappa_est <- Q_est[1,1]  
+
+  beta_est <- numeric(p)
+  for (k in 1:p) {
+    Q_0k <- Q_est[1, 1+k]
+    beta_est[k] <- Q_0k / kappa_est
+  }
+  
+  return(
+    list('kappa_est' = kappa_est,
+         'beta_est' = beta_est)
+  )
+}
+```
+
+
+##  Log-likelihood
+```{r}
+# helper function
+calc_quad_form <- function(v, kappa, beta) {
+  N <- length(v)
+  p <- length(beta)
+  
+  # diagonal
+  quad <- kappa * sum(v^2)
+  
+  # Off diagonals
+  for (k in 1:p) {
+    shifted_indices <- ((0:(N-1) + k ) %% N) + 1
+    inner_sum <- sum(v * v[shifted_indices])
+    
+    quad <- quad + 2 * kappa * beta[k] * inner_sum
+  }
+  
+  return(quad)
+}
+
+# helper function
+calc_log_det <- function(beta_vec, kappa, N) {
+  p <- length(beta_vec)
+  term1 = N*log(kappa)
+  
+  j_seq = 0:(N-1)
+  term2 = sum(sapply(j_seq, function(j) {
+    l_seq = 1:p
+    cosines = cos(2*pi*l_seq*j/N)
+    return(log(1 + 2*sum(beta_vec*cosines)))
+  }))
+  return(term1 + term2)
+}
+
+#log like, single realization
+log_like_single <- function(beta_vec, kappa, mu, v) {
+  N = length(v)
+  log_det = calc_log_det(beta_vec, kappa, N)
+  v_ = v -mu
+  quad_form = calc_quad_form(v_, kappa, beta_vec)
+  return(1/2*log_det - N/2*log(2*pi) - 1/2*quad_form)
+}
+
+# sum over m realizations
+log_like <- function(beta_vec, kappa, mu, V) {
+  apply(V, 1, function(x) {
+    log_like_single(beta_vec, kappa, mu, x)
+  }) %>% sum %>% return
+}
+```
+
+
+
+## Likelihood-ratio simulations
+```{r}
+N <- 20
+m <- 100
+
+Q1 <- create_circulant_precision_matrix_p(10, c(-0.25), N)
+Q2 <- create_circulant_precision_matrix_p(10, c(-0.25, -0.2), N)
+Q3 <- create_circulant_precision_matrix_p(10, c(-0.25, -0.1, -0.1), N)
+Q4 <- create_circulant_precision_matrix_p(10, c(-0.1, -0.1, -0.1, -0.1), N)
+```
+
+```{r}
+N_trials <- 2e3
+lr_stats_analytical <- numeric(N_trials)
+lr_stats_numerical <- numeric(N_trials)
+
+
+# for (t in 1:N_trials) {
+#   if (t %% 100 == 0) {
+#     cat('Trial #: ', t)
+#   }
+#   
+#   V4 <- simulate_circulant_GMRF(0, Q4, nsim = m)
+#   
+#   mu_est <- mean(V4)
+#   
+#   est_analytical_p8 <- solve_params_analytical(V4, 8)
+#   est_analytical_p4 <- solve_params_analytical(V4, 4)
+#   
+#   est_numerical_p8 <- solve_params_numerical(initial_guess_betas = est_analytical_p8$beta_est, V4)
+#   est_numerical_p4 <- solve_params_numerical(initial_guess_betas = est_analytical_p4$beta_est, V4)
+#   
+#   test_stat_analytical <- -2*(log_like(est_analytical_p4$beta_est, est_analytical_p4$kappa_est, mu_est, V4) - 
+#                              log_like(est_analytical_p8$beta_est, est_analytical_p8$kappa_est, mu_est, V4))
+#   
+#   test_stat_numerical <- -2*(log_like(est_numerical_p4$beta_est, est_numerical_p4$kappa_est, mu_est, V4) - 
+#                              log_like(est_numerical_p8$beta_est, est_numerical_p8$kappa_est, mu_est, V4))
+#   
+#   lr_stats_analytical[t] <- test_stat_analytical
+#   lr_stats_numerical[t] <- test_stat_numerical
+# }
+```
+
+- Above code with parallel execution:
+```{r}
+library(doParallel)
+library(foreach)
+
+
+n.cores <- detectCores() - 1       
+cl <- makeCluster(n.cores)
+registerDoParallel(cl)
+
+
+clusterExport(cl, c("simulate_circulant_GMRF", "solve_params_analytical",
+                    "solve_params_numerical", "log_like", "Q4", "m", 'N', "multiroot", '%>%'))
+
+
+res <- foreach(t = 1:N_trials, .combine = 'rbind') %dopar% {
+  V4 <- simulate_circulant_GMRF(0, Q4, nsim = m)
+  mu_est <- mean(V4)
+
+
+  a8 <- solve_params_analytical(V4, 8)
+  a4 <- solve_params_analytical(V4, 4)
+
+
+  n8 <- solve_params_numerical(initial_guess_betas = a8$beta_est, V4)
+  n4 <- solve_params_numerical(initial_guess_betas = a4$beta_est, V4)
+
+
+  ts_analytical <- -2*(log_like(a4$beta_est, a4$kappa_est, mu_est, V4) -
+                           log_like(a8$beta_est, a8$kappa_est, mu_est, V4))
+  ts_numerical <- -2*(log_like(n4$beta_est, n4$kappa_est, mu_est, V4) -
+                           log_like(n8$beta_est, n8$kappa_est, mu_est, V4))
+
+  c(ts_analytical, ts_numerical)
+}
+
+stopCluster(cl)
+
+# saved as .rds files
+lr_stats_analytical <- res[,1]
+lr_stats_numerical  <- res[,2]
+
+```
+
+```{r}
+# lr_stats_analytical <- read_rds('lr_stats_analytical_n20_m100_8_to_4.rds')
+# lr_stats_numerical <- read_rds('lr_stats_numerical_n20_m100_8_to_4.rds')
+```
+
+
+```{r}
+p_vals_analytical <- 1- pchisq(unname(lr_stats_analytical), 4)
+p_vals_numerical <- 1- pchisq(unname(lr_stats_numerical), 4)
+
+mean(p_vals_analytical < 0.05, na.rm = T)
+mean(p_vals_numerical < 0.05, na.rm = T)
+```
+
+
+```{r}
+lr_stats_analytical_censored = pmax(lr_stats_analytical, 0)
+hist(lr_stats_analytical_censored, breaks = 100, probability = T, ylim = c(0, 0.35), xlim = c(0, 25),
+     main = 'Histogram of likelihood ratio statistics (analytical method)',
+     xlab = 'Likelihood ratio statistic')
+curve(dchisq(x, 4), add = T, lwd = 1.5, lty = 'dashed')
+
+legend( "topright",
+        legend = expression( chi^2*"(4)" ~ "density" ),
+        lty    = "dashed",
+        lwd    = 1.5,
+        bty    = "n" )
+```
+
+
+```{r}
+hist(lr_stats_numerical, breaks = 50, probability = T, ylim = c(0, 0.25),
+     xlab = 'Likelihood ratio statistic', ylab = 'Density', main = 'Histogram of likelihood ratio statistics (numerical method)')
+curve(dchisq(x, 4), add = T, lwd = 1.5, lty = 'dashed')
+
+
+legend( "topright",
+        legend = expression( chi^2*"(4)" ~ "density" ),
+        lty    = "dashed",
+        lwd    = 1.5,
+        bty    = "n" )
+```
+

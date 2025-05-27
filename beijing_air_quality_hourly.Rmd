@@ -1,0 +1,557 @@
+---
+title: "air quality circulant"
+output: html_document
+date: "2025-05-06"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rootSolve)
+```
+
+### Circulant model estimation
+ - Circulant model by creating a 24 dimensional model via the hourly observations.
+ - Treat each day as an independent realization
+```{r}
+folder <- 'Data/Beijing_data/PRSA_Data_20130301-20170228/'
+files <- list.files(folder)
+df_list = lapply(paste0(folder,files), read_csv)
+df1 <- df_list[[6]]
+```
+
+
+### ACF alternative
+```{r}
+log(df1$PM10) %>% na.omit %>% acf(main = '')
+```
+
+#### Gaussian kernel and exponential covariance function fitted to ACF
+```{r}
+acf_obj <- log(df1$PM10) %>% na.omit %>% acf(plot = F)
+
+lags <- as.numeric(acf_obj$lag)
+acf_vals <- as.numeric(acf_obj$acf)
+
+df_acf <- data.frame(lag = lags, rho = acf_vals)
+
+fit_gauss <- nls(rho ~ exp(-lag^2 / (2 * sigma^2)),
+           data = df_acf,
+           start = list(sigma = 5),
+           control = nls.control(maxiter = 100))
+
+fit_exp <- nls(rho ~ exp(-a*lag),
+           data = df_acf,
+           start = list(a = 1),
+           control = nls.control(maxiter = 100))
+
+plot(acf_obj, main = "")
+lines(df_acf$lag,
+      predict(fit_gauss),
+      col = "red", lty = 'dashed', lwd = 1.5)
+lines(df_acf$lag,
+      predict(fit_exp),
+      col = "orange", lty = 'dashed', lwd = 1.5)
+
+legend("topright", legend = c("Gaussian fit", "Exponential fit"), 
+       col = c("red", "orange"), 
+       lwd = c(1.5, 1.5), lty = c('dashed', 'dashed'))
+
+# AIC(fit_gauss, fit_exp)
+```
+
+
+
+
+### Periodogram
+
+```{r}
+spec <- stats::spec.pgram(
+  log(df1$PM10) %>% na.omit,
+  taper = 0,
+  plot = FALSE,
+  detrend = F,
+  demean = T
+)
+
+
+periods <- 1 / spec$freq
+
+plot(
+  periods, spec$spec,
+  type = "l",        
+  xlim = c(0, 500),  # up up to 500-hour cycles
+  xlab = "Period (hours)",
+  ylab = "Spectral density",
+  main = "Periodogram of hourly PM10", 
+  lwd = 1
+)
+abline(v = c(24, 168), col = rgb(255, 0, 0, 0.4*255, maxColorValue = 255), lty = 'dashed', lwd = 1)
+text(c(24,168), 
+     par("usr")[4]*c(0.8,0.8), 
+     labels = c("24h (1 day)","168h (1 week)"), 
+     col="red", adj = c(0,1))
+```
+
+```{r}
+s <- spec$spec
+
+# local maxima where s[i] > s[i-1] and s[i] > s[i+1]
+peak_idx <- which(diff(sign(diff(s))) == -2) + 1
+
+peak_periods <- periods[peak_idx]
+peak_power   <- s[peak_idx]
+
+
+top20 <- order(peak_power, decreasing=TRUE)[1:20]
+
+data.frame(
+  period = peak_periods[top20],
+  power  = peak_power[top20]
+)
+```
+
+
+### Mean per hour and weekday/weekend
+
+```{r}
+global_mean <- df1 %>% 
+  summarise(m = mean(log(PM10), na.rm=TRUE)) %>% 
+  pull(m)
+
+df_summary <- df1 %>%
+  mutate(
+    log_obs = log(PM10),
+    dt = make_datetime(year, month, day, hour, tz = "Asia/Shanghai"),
+    weekday = wday(dt, label=TRUE, abbr=FALSE, locale = 'en_US'),
+    Weekend = factor(weekday %in% c("Saturday","Sunday"), levels = c(FALSE,TRUE), 
+                     labels = c("Weekday","Weekend"))
+  ) %>% 
+  group_by(hour, Weekend) %>%
+  summarise(mean_hour = mean(log_obs, na.rm=TRUE), .groups="drop")
+
+ggplot(df_summary, aes(hour+1, mean_hour)) +
+  geom_line(aes(linetype = Weekend)) +
+  geom_hline(aes(yintercept = global_mean,
+                 linetype     = "Global mean"),
+             color = "red", alpha = 0.8) +
+  scale_linetype_manual(
+    name   = NULL,
+    values = c(
+      "Weekday"     = "solid",
+      "Weekend"     = "dotted",
+      "Global mean" = "dashed"
+    ),
+    guide = guide_legend(
+      override.aes = list(
+        color = c("black","black","red")
+      )
+    )
+  ) +
+  labs(x = "Hour of day", y = "Mean log(PM10)") +
+  scale_x_continuous(
+    breaks = seq(1, 24, by = 2),
+    labels = function(x) sprintf("%02d:00", x)
+  ) +
+  theme_minimal()
+
+```
+
+### Data wrangling to get a data matrix
+m = days
+dim af data: days x 24 med en af de målte variable
+
+```{r}
+df_ <- df1 %>% 
+  mutate(date = make_date(year, month, day)) %>% 
+  mutate(log_obs = log(PM10)) %>% 
+  select(date, hour, log_obs)
+  
+
+df_wide <- df_ %>% pivot_wider(id_cols = date,
+                    names_from = hour, 
+                    values_from = log_obs,
+                    names_prefix = 'h') %>% na.omit
+```
+
+```{r}
+data1 <- df_wide %>% 
+  select(-date) %>% 
+  as.matrix %>% unname
+```
+
+
+
+
+### Numerical estimation 
+```{r}
+R_val <- function(v, mu, k) {
+  N <- length(v)
+  v_ = v- mu
+  shifted_indices <- ((0:(N-1) + k ) %% N) + 1
+  return( sum(v_ * v_[shifted_indices]) ) 
+}
+
+R_val_vec <- Vectorize(R_val, 'k')
+
+
+kappa_hat_numerical <- function(beta_vec, mu, V) {
+  m = nrow(V)
+  N = ncol(V)
+  p = length(beta_vec)
+  sum_squares <- sum(apply(V, 1, function(x) sum((x-mu)^2)))
+  R_vals = apply(V, 1, function(x) R_val_vec(x, mu, 1:p))
+  denom = sum_squares + 2*sum(beta_vec*R_vals)
+  return(N*m/denom)
+}
+
+score_beta_numerical <- function(beta_vec, V, mu) {
+  N <- ncol(V)
+  m <- nrow(V)
+  p <- length(beta_vec)
+  f <- numeric(p)
+  
+  kappa_est = kappa_hat_numerical(beta_vec, mu, V)
+  
+  for (k in 1:p) {
+    
+    j_seq = 0:(N-1)
+    
+    term1 <- m*sum(sapply(j_seq, function(j) {
+      numerator = cos(2*pi*j*k/N)
+      cosines_denom_j = cos(2*pi*j*(1:p)/N)
+      denom = 1 + 2*sum(beta_vec*cosines_denom_j)
+      
+      return(numerator/denom)
+    }))
+    
+    R_val_k = sum(apply(V, 1, function(x) R_val(x, mu, k)))
+    term2 = kappa_est*R_val_k
+    
+    f[k] <- term1 - term2
+  }
+  return(f)
+}
+
+score_beta_numerical_single <- function(beta_vec, V, mu) {
+  N <- ncol(V)
+  m <- nrow(V)
+  p <- length(beta_vec)
+  f <- numeric(p)
+  
+  kappa_est = kappa_hat_numerical(beta_vec, mu, V)
+  
+  for (k in 1:p) {
+    
+    j_seq = 0:(N-1)
+    
+    term1 <- m*sum(sapply(j_seq, function(j) {
+      numerator = cos(2*pi*j*k/N)
+      cosines_denom_j = cos(2*pi*j*(1:p)/N)
+      denom = 1 + 2*sum(beta_vec*cosines_denom_j)
+      
+      return(numerator/denom)
+    }))
+    
+    R_val_k = sum(apply(V, 1, function(x) R_val(x, mu, k)))
+    term2 = kappa_est*R_val_k
+    
+    f[k] <- term1 - term2
+  }
+  return(f)
+}
+
+solve_params_numerical <- function(initial_guess_betas, V) {
+  mu_est <- mean(V)
+  solution <- multiroot(f = function(bet) score_beta_numerical(bet, V, mu_est), start = initial_guess_betas)
+  beta_est_num <- solution$root
+  kappa_est_num = kappa_hat_numerical(beta_est_num, mu_est, V)
+  
+  return(
+    list('kappa_est' = kappa_est_num,
+         'beta_est' = beta_est_num,
+         'mu_est' = mu_est)
+  )
+}
+solve_params_numerical_single <- function(V) {
+  mu_est <- mean(V)
+  solution <- uniroot(f = function(bet) score_beta_numerical(bet, V, mu_est), lower = -0.5, upper = 0.5)
+  beta_est_num <- solution$root
+  kappa_est_num = kappa_hat_numerical(beta_est_num, mu_est, V)
+  
+  return(
+    list('kappa_est' = kappa_est_num,
+         'beta_est' = beta_est_num,
+         'mu_est' = mu_est)
+  )
+}
+```
+
+### Analytical estimation
+```{r}
+# A function to cyclically shift a vector by 'shift_by' positions to the left
+cyclic_shift <- function(vec, shift_by) {
+  n <- length(vec)
+  if (shift_by == 0) {
+    return(vec)
+  }
+  # shift by 1: [2:n, 1].  
+  # shift by 2: [3:n, 1:2].
+  return(c(vec[(shift_by+1):n], vec[1:shift_by]))
+}
+
+
+# Cycle-average covariance from ONE vector of length N
+cov_cycle_one <- function(x) {
+  N <- length(x)
+  j_seq <- 0:(N-1)
+  outer_prods <- lapply(j_seq, function(j) {
+    x_shift <- cyclic_shift(x, j)
+    return(outer(x_shift, x_shift))
+  })
+  return(Reduce("+", outer_prods) / N)
+}
+
+
+# Handle M realizations
+cov_cycle_multi <- function(V, mu_est) {
+  V = V-mu_est
+  # V is m x N
+  m <- nrow(V)
+  N <- ncol(V)
+  
+  cov_list <- vector("list", m)
+  for (i in seq_len(m)) {
+    x_i <- V[i, ]  # one realization
+    cov_list[[i]] <- cov_cycle_one(x_i)
+  }
+  Sigma_est <- Reduce("+", cov_list) / m  
+  return(Sigma_est)
+}
+
+solve_params_analytical <- function(V, p) {
+  mu_est = mean(V)
+  Sigma_est <- cov_cycle_multi(V, mu_est)
+  Q_est <- solve(Sigma_est)
+  kappa_est <- Q_est[1,1]  
+
+  beta_est <- numeric(p)
+  for (k in 1:p) {
+    Q_0k <- Q_est[1, 1+k]
+    beta_est[k] <- Q_0k / kappa_est
+  }
+  
+  return(
+    list('kappa_est' = kappa_est,
+         'beta_est' = beta_est)
+  )
+}
+```
+
+
+## Estimates on all the data
+```{r}
+analytical_ests <- solve_params_analytical(data1, 12)
+est_num_single <- solve_params_numerical_single(data1)
+#solve_params_numerical(analytical_ests$beta_est, data1)
+
+```
+
+```{r}
+plot(1:12, analytical_ests$beta_est, type = 'h', lwd = 1.5, ylab = '', xaxt = 'n', xlab = '')
+points(analytical_ests$beta_est, pch = 20)
+abline(h = 0, lty = 'dashed')
+axis(
+  side = 1,
+  at = 1:12,
+  labels = parse(text = paste0("beta[", 1:12, "]")),
+  las = 1
+)
+```
+
+ 
+ 
+## Residuals and partial correlation of these
+```{r}
+
+mu_est  <- est_num_single$mu_est
+beta_est <- est_num_single$beta_est  
+N   <- ncol(data1)
+
+fitted_mat <- t( apply(data1, 1, function(v){
+  im1   <- c(N, 1:(N-1))   
+  ip1   <- c(2:N, 1)       
+  mu_est - beta_est*((v[im1]-mu_est)+(v[ip1]-mu_est))
+}) )
+
+R_in <- data1 - fitted_mat   # residuals matrix
+
+S  <- cov(R_in)
+
+prec_R <- solve(S)
+
+pcor_mat <- -prec_R / sqrt( outer(diag(prec_R), diag(prec_R)) )
+diag(pcor_mat) <- 1
+
+# pcor_mat[i,j] is the partial correlation between residuals
+# at hour i and hour j, controlling for all other hours.
+
+
+```
+
+ 
+```{r}
+h12_pcor = pcor_mat[12,]
+h12_pcor[12] = NA
+plot(1:24, h12_pcor, xlab = 'Hour', ylab = 'Conditional corr. with H12', pch = 20)
+```
+
+ 
+## Estimates for each weekday
+```{r}
+Sys.setlocale('LC_TIME', 'en_US')
+create_weekday_data_matrix <- function(df, dow) {
+  df_wday = df %>% 
+    mutate(date = make_date(year, month, day),
+           weekday = weekdays(date),
+           log_obs = log(PM10)) %>% 
+    filter(weekday == dow) %>% 
+    select(date, hour, log_obs)
+  
+  df_wider <- df_wday %>% pivot_wider(id_cols = date,
+                    names_from = hour, 
+                    values_from = log_obs,
+                    names_prefix = 'h') %>% na.omit
+  
+  data_mat <- df_wider %>% 
+    select(-date) %>% 
+    as.matrix %>% unname
+  return(data_mat)
+}
+
+dows = c('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 
+         'Saturday', 'Sunday')
+
+
+result_list = list()
+mus = numeric(7)
+names(mus) = dows
+
+kappas = numeric(7)
+names(kappas) = dows
+
+betas = numeric(7)
+names(betas) = dows
+
+for (dow in dows) {
+  dat = create_weekday_data_matrix(df1, dow)
+  ests_analytical = solve_params_analytical(dat, 12)
+  numerical_est_single = solve_params_numerical_single(dat)
+  result_list[[dow]] = unlist(numerical_est_single)
+  mus[dow] = numerical_est_single$mu_est
+  kappas[dow] = numerical_est_single$kappa_est
+  betas[dow] = numerical_est_single$beta_est
+}
+```
+
+
+
+
+## Crossvalidation out of sample predictions
+
+Forecasting - brug kun den forrige nabo
+
+
+Vælg en enkelt dag og brug alle 24 timer som eksempel
+```{r}
+days <- 1:nrow(data1)
+errors <- numeric(nrow(data1))
+preds <- numeric(nrow(data1))
+true_vals <- numeric(nrow(data1))
+hours_left_out = numeric(nrow(data1))
+
+for (d in days) {
+  set.seed(42 + d)
+  train_idx = setdiff(days, d)
+  data_train = data1[train_idx,]
+  data_test = data1[d,]
+  
+  params <- solve_params_analytical(data_train, 1)
+  mu_cv = mean(data_train)
+  beta_cv <- params$beta_est
+  
+  
+  h <- sample(1:24, 1)
+  hours_left_out[d] <- h
+  
+  hm1 = if(h==1) 24 else h-1
+  hp1 = if(h==24) 1 else h+1
+  
+  Y_obs <- data_test
+  true_vals[d] <- Y_obs[h]
+
+  Y_obs[h] <- NA
+  pred_h <- mu_cv - beta_cv*((Y_obs[hm1]-mu_cv)+(Y_obs[hp1]-mu_cv))
+  preds[d] <- pred_h
+  
+  errors[d] <- (pred_h - data_test[h])^2
+}
+
+
+#single day example
+d = 200
+train_idx = setdiff(days, d)
+data_train = data1[train_idx,]
+data_test = data1[d,]
+
+params <- solve_params_analytical(data_train, 1)
+mu_cv = mean(data_train)
+beta_cv <- params$beta_est[1]
+
+true_vals_single_day = numeric(24)
+preds_single_day = numeric(24)
+
+for (h in 1:24) {
+  
+  hm1 = if(h==1) 24 else h-1
+  hp1 = if(h==24) 1 else h+1
+  
+  Y_obs <- data_test
+  true_vals_single_day[h] <- Y_obs[h]
+  
+  Y_obs[h] <- NA
+  pred_h <- mu_cv - beta_cv*((Y_obs[hm1]-mu_cv)+(Y_obs[hp1]-mu_cv))
+  preds_single_day[h] <- pred_h
+}
+```
+
+
+```{r}
+plot(1:24, true_vals_single_day, type = 'o', xlab = 'Hour', ylab = 'log(PM10)')
+points(1:24, preds_single_day, col = 'red', pch = 4, type = 'o')
+legend('topleft', legend = c('Predicted', 'True'), pch = c(4, 1), col = c('red', 'black'), cex = 0.9, bty = 'n')
+```
+
+
+## Errors grouped on hours
+```{r}
+df_errors <- data.frame(hours_left_out, preds, true_vals)
+
+errors_per_hour <- df_errors %>% 
+  group_by(hours_left_out) %>% 
+  summarise(error = sqrt(mean((preds-true_vals)^2)),
+            n = n())
+
+errors_per_hour %>% 
+  ggplot(aes(x = hours_left_out, y = error)) + 
+  geom_col() +
+  labs(x = "Hour of day", y = "RMSE") +
+  scale_x_continuous(
+    breaks = seq(1, 24, by = 2)
+  ) +
+  geom_hline(aes(yintercept = sqrt(mean(errors))), linetype = 'dashed', col = 'red', alpha = 0.8)+
+  theme_minimal()
+```
+
