@@ -1,0 +1,480 @@
+---
+title: "beijing_air_quality_spatial"
+output: html_document
+date: "2025-05-07"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggrepel)
+```
+
+```{r}
+folder <- 'Data/Beijing_data/PRSA_Data_20130301-20170228/'
+files <- list.files(folder)
+df_list = lapply(paste0(folder,files), read_csv)
+df1 <- df_list[[1]]
+```
+
+
+Locations of the measuring sites (from https://www.mdpi.com/2071-1050/14/9/5104?utm)
+```{r}
+beijing_sites <- tibble(
+  Station = c(
+    "Aotizhongxin", "Changping",   "Dingling",       "Dongsi",
+    "Guanyuan",     "Gucheng",     "Huairou",        "Nongzhanguan",
+    "Shunyi",       "Tiantan",     "Wanliu",         "Wanshouxigong"
+  ),
+  Longitude = c(
+    116.397, 116.230, 116.220, 116.417,
+    116.339, 116.184, 116.628, 116.461,
+    116.655, 116.407, 116.287, 116.352
+  ),
+  Latitude = c(
+    39.982,  40.217,  40.292,  39.929,
+    39.929,  39.914,  40.328,  39.937,
+    40.127,  39.886,  39.987,  39.878
+  )
+)
+
+beijing_sites
+```
+
+
+Create a 12-dim model based on the stations.
+Potentially treat each hour as an independent observation - or maybe take mean across the entire day 
+
+### Input data
+
+```{r}
+all_stations_df <- df_list %>% reduce(rbind)
+```
+
+```{r}
+all_stations_df <- all_stations_df %>% 
+  left_join(beijing_sites, by = c('station' = 'Station'))
+```
+
+
+```{r}
+
+# df_wide <- all_stations_df %>% 
+#   mutate(date = make_date(year, month, day)) %>% 
+#   group_by(date, station) %>% 
+#   summarise(mean_obs_no2 = mean(NO2, na.rm = T), 
+#             mean_obs_pm25 = mean(PM2.5, na.rm = T),
+#             mean_obs_pm10 = mean(PM10, na.rm = T),
+#             mean_obs_co = mean(CO, na.rm = T),
+#             mean_obs_o3 = mean(O3, na.rm = T),
+#             mean_obs_so2 = mean(SO2, na.rm = T)) %>% 
+#   mutate(log_obs_no2 = log(mean_obs_no2),
+#          log_obs_pm25 = log(mean_obs_pm25),
+#          log_obs_pm10 = log(mean_obs_pm10),
+#          log_obs_co = log(mean_obs_co),
+#          log_obs_o3 = log(mean_obs_o3),
+#          log_obs_so2 = log(mean_obs_so2)
+#          #log_obs_dm = log_obs - global_mean
+#          ) %>% 
+#   ungroup %>% 
+#   select(date, station, starts_with(c('log_obs', 'mean_obs'))) %>% 
+#   #pivot_wider(id_cols = date, names_from = station, values_from = log_obs) %>% 
+#   na.omit
+
+
+# NO2 has lowest acf - makes most sense to use this for independent realizations across days
+df_wide <- all_stations_df %>% 
+  mutate(date = make_date(year, month, day)) %>% 
+  group_by(date, station) %>% 
+  summarise(mean_obs = mean(NO2, na.rm = T),
+            log_obs = log(mean_obs)) %>% 
+  ungroup() %>% 
+  pivot_wider(id_cols = date, names_from = station, values_from = log_obs) %>% 
+  na.omit
+```
+
+```{r}
+data_matrix = df_wide %>% 
+  select(-date) %>% 
+  as.matrix %>% 
+  unname
+```
+
+```{r}
+all_stations_df %>% 
+  mutate(date = make_date(year, month, day)) %>% 
+  group_by(date, station) %>% 
+  summarise(mean_obs = mean(NO2, na.rm = T),
+            log_obs = log(mean_obs)) %>% 
+  ungroup() %>% 
+  group_by(station) %>% 
+  summarise(mean_ = mean(log_obs, na.rm = T))
+```
+
+
+
+### Kernel-model functions
+
+```{r}
+log_like_kernel_single <- function(V_vec, W, W_tilde, eigenvals, rowsums, mu, phi, lambda) {
+  N = length(V_vec)
+  v_ = V_vec-mu 
+  
+  
+  term1 = -N/2*log(lambda)
+  term2 = 1/2*sum(log(rowsums))
+  term3 = 1/2*sum(log(1 - phi*eigenvals))
+  term4 = -N/2*log(2*pi)
+  term5 = -1/(2*lambda)*sum(v_^2*rowsums)
+  term6 = phi/(2*lambda)*(v_%*%W%*%v_)
+  
+  return(term1 + term2 + term3 + term4 + term5 + term6)
+}
+
+log_like_kernel <- function(V, W, W_tilde, eigenvals, rowsums, mu, phi, lambda){
+  apply(V, 1, function(x) log_like_kernel_single(x, W, W_tilde, eigenvals, rowsums, mu, phi, lambda)) %>% 
+    sum %>% return
+}
+
+
+quad_terms_single_v <- function(v, mu, phi, W, rowsums) { 
+  v <- v - mu
+  term1 <- sum(v^2*rowsums)
+  term2 <- phi* (v%*%W%*%v)
+  return(term1 - term2)
+}
+
+lam_estimate <- function(v, mu, phi, W, rowsums) {
+  m <- nrow(v)
+  N <- ncol(v)
+  quad_terms <- apply(v, 1, function(v_) quad_terms_single_v(v_, mu, phi, W, rowsums))
+  return (sum(quad_terms) / (N*m))
+}
+
+# eigenvalues of W_tilde - calculate once 
+score_phi <- function(phi, v, mu, eigenvals_W_tilde, W, rowsums) {
+  N <- ncol(v)
+  m <- nrow(v)
+  term1 <- -m/2 * sum( eigenvals_W_tilde/(1-phi*eigenvals_W_tilde))
+  
+  sum_quads_denom = sum(apply(v, 1, function(v_) quad_terms_single_v(v_, mu, phi, W, rowsums)))
+  sum_quads_numer = sum(apply(v, 1, function(v_) {
+    v = v_-mu
+    return(v%*%W%*%v)
+  }))
+  term2 <- N*m/(2*sum_quads_denom) *sum_quads_numer
+  return(term1 + term2)
+}
+```
+
+
+
+```{r}
+D <- dist(beijing_sites %>%
+            select(Longitude, Latitude),
+          diag = T, upper = T) %>% as.matrix
+
+sigmas = seq(0.05, 0.3, by = 0.01)
+lls = numeric(length(sigmas))
+names(lls) = as.character(sigmas)
+
+mu_est = mean(data_matrix)
+for (sig in sigmas) {
+  W <- exp(-D^2/(2*sig^2))
+  diag(W) = 0 
+  
+  rowsums <- rowSums(W)
+  W_tilde <- sweep(W, 1, FUN = '/', STATS = rowsums)
+  lambdas <- eigen(W_tilde)$values
+  
+  res <- uniroot(
+    f = function(phi) score_phi(phi, data_matrix, mu_est,lambdas, W, rowsums),
+    lower = 0,
+    upper = 1-1e-8
+  )
+  
+  phi_est <- res$root
+  lam_est <- lam_estimate(data_matrix,mu_est, phi_est, W, rowsums)
+  ll = log_like_kernel(data_matrix, W, W_tilde, lambdas, rowsums, mean(data_matrix), phi_est, lam_est)
+  lls[as.character(sig)] = ll
+}
+lls
+plot(sigmas, lls, type = 'b')
+```
+
+```{r}
+sigma_max = sigmas[which.max(lls)]
+
+W <- exp(-D^2/(2*sigma_max^2))
+#W[W<0.05] <- 0
+diag(W) = 0 
+
+rowsums <- rowSums(W)
+W_tilde <- sweep(W, 1, FUN = '/', STATS = rowsums)
+lambdas <- eigen(W_tilde)$values
+
+res <- uniroot(
+  f = function(phi) score_phi(phi, data_matrix, mu_est, lambdas, W, rowsums),
+  lower = 0,
+  upper = 1-1e-8
+)
+
+phi_est <- res$root
+lam_est <- lam_estimate(data_matrix,mu_est, phi_est, W, rowsums)
+
+log_like_kernel(data_matrix, W, W_tilde, lambdas, rowsums, mu_est, phi_est, lam_est)
+c('phi_est'=phi_est, 'lambda_est' = lam_est)
+```
+
+What does the precision matrix then look like and what are the conditional correlations?
+
+```{r}
+sigma2s <- lam_est/rowsums
+Q <- diag(1/sigma2s) %*% (diag(12) - phi_est*W_tilde)
+```
+
+```{r}
+cond_corr <- function(i,j) {
+  - Q[i,j] / sqrt( Q[i,i] * Q[j,j] )
+}
+vec_cond_corr <- Vectorize(cond_corr)
+cond_corr_mat <- outer(1:12, 1:12, vec_cond_corr)
+diag(cond_corr_mat) <- NA
+```
+
+
+
+
+## Visualization of conditional correlations
+
+```{r}
+station_name = beijing_sites$Station[4]
+cond_corr_station <- cond_corr_mat[4,-4]
+names(cond_corr_station) <- beijing_sites %>% 
+  filter(Station != station_name) %>% pull(Station)
+```
+
+```{r}
+df_other_stations <- beijing_sites %>% filter(Station != station_name) %>% 
+  mutate(cond_corr_with_ref = cond_corr_station)
+ref <- beijing_sites %>% filter(Station == station_name)
+```
+
+
+
+```{r}
+ggplot() +
+  geom_point(data = df_other_stations, 
+             aes(x = Longitude, y = Latitude, size  = cond_corr_station),
+             alpha = 0.7,
+             stroke = 0.9,    
+             shape = 20) +
+  geom_point(data = ref, aes(x = Longitude, y = Latitude),
+    color = "red", fill  = "white",shape = 4, size = 2,stroke = 1.2) +
+  
+  geom_text(
+    data = ref,
+    aes(x = Longitude, y = Latitude, label = Station),
+    vjust = -0.5,
+    hjust = 0.5,
+    size = 3.5,
+    color = "red"
+  ) +
+  scale_size_continuous(range = c(2, 10), name  = "Cond.\nCorr.") +
+  geom_text_repel(
+    data = df_other_stations,
+    aes(x = Longitude, y = Latitude, label = Station),
+    size = 3,
+    box.padding=0.55,
+    segment.size = 0.3,
+    segment.alpha = 0.5
+  ) +
+  coord_fixed() +
+  theme(
+    legend.position = "right",
+    legend.title     = element_text(size = 10),
+    legend.text      = element_text(size = 8),
+    plot.title       = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.margin      = margin(10, 10, 10, 10)) +
+  theme_minimal()
+```
+
+### Conditional correlation of residuals
+```{r}
+
+## predictions for all stations 
+pred_at_i <- function(i, Y_obs, Q_hat, mu){
+  # all other station indices
+  others <- setdiff(seq_along(Y_obs), i)
+  Qrow    <- Q_hat[i, others] # 
+  # observations at the other stations
+  y_other <- Y_obs[others]
+  mu - (1/Q_hat[i,i]) * sum( Qrow * (y_other - mu) )
+}
+
+
+fitted_mat <- t( apply(data_matrix, 1, function(Y_obs){
+  sapply(seq_len(ncol(data_matrix)),
+         pred_at_i,
+         Y_obs = Y_obs,
+         Q_hat = Q,
+         mu = mu_est)
+}) )
+
+
+# Residuals
+R_in <- data_matrix - pred_matrix
+
+# Covariance of residuals
+S  <- cov(R_in)
+
+# Precision matrix of residuals 
+prec_R <- solve(S)
+
+# Partial correlation from precision 
+pcor_mat <- -prec_R / sqrt( outer(diag(prec_R), diag(prec_R)) )
+diag(pcor_mat) <- 1
+```
+
+
+```{r}
+pcor_row = pcor_mat[4,][-4]
+station_held_out = 'Dongsi'
+df_pcor_errors <- beijing_sites %>% 
+  filter(Station != station_held_out) %>% 
+  mutate(pcor_resid = pcor_row)
+
+ref = beijing_sites %>% 
+  filter(Station == station_held_out)
+  
+
+ggplot() +
+  geom_point(data = df_pcor_errors, 
+             aes(x = Longitude, y = Latitude, size  = pcor_resid),
+             alpha = 0.7,
+             stroke = 0.9,    
+             shape = 20) +
+  geom_point(data = ref, aes(x = Longitude, y = Latitude),
+    color = "red", fill  = "white",shape = 4, size = 2,stroke = 1.2) +
+  
+  geom_text(
+    data = ref,
+    aes(x = Longitude, y = Latitude, label = Station),
+    vjust = -0.5,
+    hjust = 0.5,
+    size = 3.5,
+    color = "red"
+  ) +
+  scale_size_continuous(range = c(2, 10), 
+                        name  = "Cond. corr\nof residuals.",
+                        trans = "reverse") +
+  geom_text_repel(
+    data = df_other_stations,
+    aes(x = Longitude, y = Latitude, label = Station),
+    size = 3,
+    box.padding=0.55,
+    segment.size = 0.3,
+    segment.alpha = 0.5
+  ) +
+  coord_fixed() +
+  theme(
+    legend.position = "right",
+    legend.title     = element_text(size = 10),
+    legend.text      = element_text(size = 8),
+    plot.title       = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.margin      = margin(10, 10, 10, 10)) +
+  theme_minimal()
+
+
+```
+
+
+
+
+## Out of sample predictions
+
+```{r}
+days <- 1:nrow(data_matrix)
+errors <- numeric(nrow(data_matrix))
+preds <- numeric(nrow(data_matrix))
+true_vals <- numeric(nrow(data_matrix))
+stations_left_out = numeric(nrow(data_matrix))
+
+for (d in days) {
+  set.seed(42 + d)
+  train_idx = setdiff(days, d)
+  data_train = data_matrix[train_idx,]
+  data_test = data_matrix[d,]
+  
+  mu_est = mean(data_train)
+  res <- uniroot(
+    f = function(phi) score_phi(phi, data_train, mu_est, lambdas, W, rowsums),
+    lower = 0,
+    upper = 1-1e-8
+  )
+  
+  phi_est <- res$root
+  lam_est <- lam_estimate(data_train ,mu_est, phi_est, W, rowsums)
+  sigma2s <- lam_est/rowsums
+  Q_hat <- diag(1/sigma2s) %*% (diag(12) - phi_est*W_tilde)
+  
+  
+  station_out <- sample(1:12, 1) 
+  stations_left_out[d] <- station_out
+  
+  Y_obs <- data_test
+  true_vals[d] <- Y_obs[station_out]
+
+  Y_obs[station_out] <- NA
+  
+  Q_row = Q_hat[station_out,][-station_out]
+  obs_row = Y_obs[-station_out]
+  
+  pred_station <- mu_est - 1/Q_hat[station_out, station_out]*(sum(Q_row*(obs_row-mu_est)))
+  preds[d] <- pred_station
+  
+  errors[d] <- (pred_station - data_test[station_out])^2
+}
+```
+
+```{r}
+plot(true_vals - preds)
+df_errors <- data.frame(stations_left_out, preds, true_vals)
+df_errors_summary = df_errors %>% group_by(stations_left_out) %>% 
+  summarise(error = sqrt(mean((preds-true_vals)^2)),
+            n = n())
+df_errors_summary$station_name = beijing_sites$Station
+df_errors_summary$long = beijing_sites$Longitude
+df_errors_summary$lat = beijing_sites$Latitude
+```
+
+3 og 7 størst fejl - giver mening da de er længst væk
+ 
+
+ 
+### Plot of errors
+
+```{r}
+library(colorspace)
+ggplot(df_errors_summary) +
+  geom_point(aes(x = long, y = lat, color = error),
+             shape = 20, size = 6) +
+  geom_text_repel(aes(x = long, y = lat, label = station_name),
+    size = 3) +
+  scale_colour_continuous_sequential(palette = "Reds 2",
+                                     begin = 0.2,
+                                     name = "RMSE") +
+  coord_fixed() +
+  theme(
+    legend.position = "right",
+    legend.title     = element_text(size = 10),
+    legend.text      = element_text(size = 8),
+    plot.title       = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.margin      = margin(10, 10, 10, 10)) +
+  labs(x = 'Longitude', y = 'Latitude', color = 'Error') + 
+  theme_minimal()
+```
+
+

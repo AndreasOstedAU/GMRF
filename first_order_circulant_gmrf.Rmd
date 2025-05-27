@@ -50,7 +50,7 @@ simulate_circulant_GMRF = function(mu, precision_mat, nsim = 1) {
 ### Varying kappa and beta - plot
 
 ```{r}
-set.seed(3)
+set.seed(1234)
 plot_data_for_gmrf <- function(kappa, beta,mu=5, N=32) {
   Q = create_circulant_precision_matrix(kappa, beta, N)
   V = simulate_circulant_GMRF(mu, Q, nsim = 1) 
@@ -101,6 +101,9 @@ df_all %>%
     axis.ticks = element_blank()   
   )
 ```
+
+
+
 
 
 ## GMRF model likelihood
