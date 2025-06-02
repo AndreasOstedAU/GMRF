@@ -56,6 +56,55 @@ beta_2 = 0.3
 1 + 2*(beta_1*cos(2*pi*j_seq/N) + beta_2*cos(2*pi*2*j_seq/N))
 ```
 
+### Covariance function
+
+
+```{r}
+N = 24
+Q <- create_circulant_precision_matrix_p(10, c(-0.15), N)
+S = solve(Q)
+R = cov2cor(S)
+
+corrs <- R[1,1:(N/2 + 1)]
+# plot(corrs)
+
+lags <- 1:(N/2 + 1) -1
+
+df_covs <- data.frame(lag = lags, rho = corrs)
+
+fit_gauss <- nls(rho ~ exp(-lag^2 / (2 * sigma^2)),
+           data = df_covs,
+           start = list(sigma = 2),
+           control = nls.control(maxiter = 50000))
+
+fit_exp <- nls(rho ~ exp(-a*lag),
+           data = df_covs,
+           start = list(a = 1),
+           control = nls.control(maxiter = 50000))
+
+sigma_fit <- coef(fit_gauss)['sigma']
+a_fit <- coef(fit_exp)['a']
+
+
+plot(lags, corrs, main = "", xlab = 'Distance', ylab = 'Correlation')
+
+curve(exp(-a_fit*x), add = T,  from = 0, to = tail(lags, 1),
+      col = 'orange', lty = 'dashed', lwd = 1.5)
+
+curve(exp(-x^2/(2*sigma_fit^2)), from = 0, to = tail(lags, 1), add = T, 
+      col = 'red', lty = 'dashed', lwd = 1.5)
+
+legend(8, 1,
+  legend = c(
+    bquote( exp(-x^2/( 2 %.% .(format(sigma_fit,digits = 3))^2 ) ) ),
+    bquote( exp(-.(format(a_fit, digits=3)) * x))
+  ),
+  col = c("red", "orange"),
+  lwd = 1.5, lty = "dashed", bty = "n", cex = 0.9
+)
+```
+
+
 
 
 ## Inference
@@ -463,10 +512,13 @@ df_estimates %>% select(-kappa) %>%
   # Hvis vi sætter minus foran estimate, er det betingede korrelationer
   ggplot() +  
   geom_col(aes(x = parameter, y = estimate, color = 'Estimates'),width = 0.4) +
+  #geom_abline(slope = 0, intercept = 0.05, linetype = 'dashed', alpha = 0.4)+
+  #geom_abline(slope = 0, intercept = -0.05, linetype = 'dashed', alpha = 0.4)+
   geom_abline(slope = 0, intercept = 0.0, linetype = 'dashed', alpha = 0.4)+
   geom_point(
     data = df_true_long,
     aes(x = parameter, y = true_value, color = "True values"),
+    #color = "red",
     shape = 95,  # underscore shape
     size = 4.5
   ) +
@@ -493,218 +545,3 @@ df_estimates %>% select(-kappa) %>%
 ```
 
 
-
-
-## Likelihood function in the p'th order model
-
-log likelihood calculation
-```{r}
-# helper function
-calc_quad_form <- function(v, kappa, beta) {
-  N <- length(v)
-  p <- length(beta)
-  
-  # diagonal
-  quad <- kappa * sum(v^2)
-  
-  # Off diagonals
-  for (k in 1:p) {
-    shifted_indices <- ((0:(N-1) + k ) %% N) + 1
-    inner_sum <- sum(v * v[shifted_indices])
-    
-    quad <- quad + 2 * kappa * beta[k] * inner_sum
-  }
-  
-  return(quad)
-}
-
-# helper function
-calc_log_det <- function(beta_vec, kappa, N) {
-  p <- length(beta_vec)
-  term1 = N*log(kappa)
-  
-  j_seq = 0:(N-1)
-  term2 = sum(sapply(j_seq, function(j) {
-    l_seq = 1:p
-    cosines = cos(2*pi*l_seq*j/N)
-    return(log(1 + 2*sum(beta_vec*cosines)))
-  }))
-  return(term1 + term2)
-}
-
-#log like, single realization
-log_like_single <- function(beta_vec, kappa, mu, v) {
-  N = length(v)
-  log_det = calc_log_det(beta_vec, kappa, N)
-  v_ = v -mu
-  quad_form = calc_quad_form(v_, kappa, beta_vec)
-  return(1/2*log_det - N/2*log(2*pi) - 1/2*quad_form)
-}
-
-# sum over m realizations
-log_like <- function(beta_vec, kappa, mu, V) {
-  apply(V, 1, function(x) {
-    log_like_single(beta_vec, kappa, mu, x)
-  }) %>% sum %>% return
-}
-```
-
-
-
-## Profile likelihood - single
-
-### Beta1
-
-```{r}
-beta1s = seq(-0.5, 0.5, by = 0.01)
-n_vals = length(beta1s)
-
-ll_beta1s = numeric(n_vals)
-for (i in 1:n_vals) {
-  beta1 = beta1s[i]
-  ll_beta1s[i] <- log_like_single(c(beta1, beta2_true), kappa_true, mu_true, V)
-}
-
-plot(beta1s, ll_beta1s, type = 'l', xlab = latex2exp::TeX(r'($\beta_1$)'), ylab = 'log-likelihood')
-abline(v = beta1_true, lty = 'dashed')
-abline(v = beta_est[1], lty = 'dashed', col = 'red')
-legend(x = 'topright', legend = c('True value', 'Estimate'), col = c('black', 'red'), lty = 'dashed', cex = 0.6)
-```
-
-
-### Beta2
-```{r}
-beta2s = seq(-0.5, 0.5, by = 0.01)
-n_vals = length(beta1s)
-
-ll_beta2s = numeric(n_vals)
-for (i in 1:n_vals) {
-  beta2 = beta2s[i]
-  ll_beta2s[i] <- log_like_single(c(beta1_true, beta2), kappa_true, mu_true, V)
-}
-
-plot(beta2s, ll_beta2s, type = 'l', xlab = latex2exp::TeX(r'($\beta_2$)'), ylab = 'log-likelihood')
-abline(v = beta2_true, lty = 'dashed')
-abline(v = beta_est[2], lty = 'dashed', col = 'red')
-legend(x = 'topright', legend = c('True value', 'Estimate'), col = c('black', 'red'), lty = 'dashed', cex = 0.6)
-```
-
-
-### Kappa
-```{r}
-kappas = seq(1, 4, by = 0.01)
-n_vals = length(kappas)
-
-ll_kappas = numeric(n_vals)
-for (i in 1:n_vals) {
-  kap = kappas[i]
-  ll_kappas[i] <- log_like_single(c(beta1_true, beta2_true), kap, mu_true, V)
-}
-
-plot(kappas, ll_kappas, type = 'l', xlab = latex2exp::TeX(r'($\kappa$)'), ylab = 'log-likelihood')
-abline(v = kappa_true, lty = 'dashed')
-abline(v = kappa_final_est, lty = 'dashed', col = 'red')
-legend(x = 'topright', legend = c('True value', 'Estimate'), col = c('black', 'red'), lty = 'dashed', cex = 0.6)
-```
-
-### mu
-```{r}
-mus = seq(4, 6, by = 0.01)
-n_vals = length(mus)
-
-ll_mus = numeric(n_vals)
-for (i in 1:n_vals) {
-  mu = mus[i]
-  ll_mus[i] <- log_like_single(c(beta1_true, beta2_true), kappa_true, mu, V)
-}
-
-plot(mus, ll_mus, type = 'l', xlab = latex2exp::TeX(r'($\mu$)'), ylab = 'log-likelihood')
-abline(v = mu_true, lty = 'dashed')
-abline(v = mu_est, lty = 'dashed', col = 'red')
-legend(x = 'topright', legend = c('True value', 'Estimate'), col = c('black', 'red'), lty = 'dashed', cex = 0.6)
-```
-
-
-
-
-## Profile likelihood - multiple
-
-
-```{r}
-set.seed(12345)
-mu_true = 0
-kappa_true = 10
-beta_1_true = -0.25
-beta_2_true = -0.1
-
-m = 100
-N = 50
-
-Q = create_circulant_precision_matrix_p(kappa_true, c(beta_1_true, beta_2_true), N = N)
-V = simulate_circulant_GMRF(mu_true, Q, nsim = m) #%>% as.matrix %>% t
-mu_est = mean(V)
-
-est_numerical = solve_params_numerical(c(-0.15, -0.15), V)
-est_analytical = solve_params_analytical(V, 2)
-
-```
-
-
-### Kappa
-
-```{r}
-n_vals <- 100
-kappas = seq(9, 11, length.out = n_vals)
-ll_kappas = numeric(n_vals)
-for (i in 1:n_vals) {
-  kap = kappas[i]
-  ll_kappas[i] <- log_like(c(est_numerical$beta_est[1], est_numerical$beta_est[2]), kap, mu_est, V)
-}
-
-
-
-plot(kappas, ll_kappas, type = 'l', xlab = latex2exp::TeX(r'($\kappa$)'), ylab = 'log-likelihood')
-abline(v = kappa_true, lty = 'dashed')
-abline(v = est_numerical$kappa_est, lty = 'dashed', col = 'red')
-abline(v = est_analytical$kappa_est, lty = 'dashed', col = 'blue')
-legend(x = 'topleft', legend = c('True value', 'Estimate numerical', 'Estimate analytical'), col = c('black', 'red', 'blue'), lty = 'dashed', cex = 0.6)
-```
-
-### Beta 1
-
-```{r}
-n_vals <- 100
-beta_1s = seq(-0.27, -0.23, length.out = n_vals)
-ll_beta_1s = numeric(n_vals)
-for (i in 1:n_vals) {
-  beta_1 = beta_1s[i]
-  ll_beta_1s[i] <- log_like(c(beta_1,  est_numerical$beta_est[2]), est_numerical$kappa_est, mu_est, V)
-}
-
-
-
-plot(beta_1s, ll_beta_1s, type = 'l', xlab = latex2exp::TeX(r'($\beta_1$)'), ylab = 'log-likelihood')
-abline(v = beta_1_true, lty = 'dashed')
-abline(v = (est_numerical$beta_est)[1], lty = 'dashed', col = 'red')
-abline(v = (est_analytical$beta_est)[1], lty = 'dashed', col = 'blue')
-legend(x = 'topright', legend = c('True value', 'Estimate numerical', 'Estimate analytical'), col = c('black', 'red', 'blue'), lty = 'dashed', cex = 0.6)
-```
-
-
-### Beta 2
-
-```{r}
-n_vals <- 100
-beta_2s = seq(-0.14, -0.06, length.out = n_vals)
-ll_beta_2s = numeric(n_vals)
-for (i in 1:n_vals) {
-  beta_2 = beta_2s[i]
-  ll_beta_2s[i] <- log_like(c( est_numerical$beta_est[1], beta_2),  est_numerical$kappa_est, mu_est, V)
-}
-
-plot(beta_2s, ll_beta_2s, type = 'l', xlab = latex2exp::TeX(r'($\beta_2$)'), ylab = 'log-likelihood')
-abline(v = beta_2_true, lty = 'dashed')
-abline(v = (est_numerical$beta_est)[2], lty = 'dashed', col = 'red')
-abline(v = (est_analytical$beta_est)[2], lty = 'dashed', col = 'blue')
-legend(x = 'topright', legend = c('True value', 'Estimate numerical', 'Estimate analytical'), col = c('black', 'red', 'blue'), lty = 'dashed', cex = 0.6)
-```
