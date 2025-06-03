@@ -23,7 +23,7 @@ index_diff <- function(i,j, N) {
 }
 
 # Distances based on arc lengths
-gauss_kernel_circ <- function(mu, sig_kernel, N) {
+gauss_kernel_circ <- function(sig_kernel, N) {
   D = outer(1:N, 1:N, function(i,j) index_diff(i,j, N)*2*pi/N)
   D_sq = D^2
   mat = exp(-D_sq/(2*sig_kernel^2))
@@ -153,7 +153,10 @@ N <- 20
 set.seed(123)
 mu_true = 0
 kappa_true = 10
-betas = c(-0.18, -0.12, -0.06, -0.03)
+# betas = c(-0.18, -0.12, -0.06, -0.03)
+# betas = c(-0.3, -0.1)
+betas = c(-0.15, -0.15, -0.08, -0.08)
+# betas = c(-0.15, -0.05, -0.1, -0.1)
 Q = create_circulant_precision_matrix_p(kappa_true, betas, N = N)
 V = simulate_circulant_GMRF(mu_true, Q, nsim = 500)
 
@@ -164,7 +167,7 @@ lls = numeric(length(sigmas_kernel))
 for (i in 1:n_sigmas) {
   sigma = sigmas_kernel[i]
   
-  W = gauss_kernel_circ(mu_est, sigma, N)
+  W = gauss_kernel_circ(sigma, N)
   rowsums <- rowSums(W)
   c <- rowsums[1]
   
@@ -188,7 +191,7 @@ for (i in 1:n_sigmas) {
 ## endelige estimater ud fra max likelihood 
 sigma_max_ll = sigmas_kernel[which.max(lls)]
 
-W = gauss_kernel_circ(mu_est, sigma_max_ll, N)
+W = gauss_kernel_circ(sigma_max_ll, N)
 rowsums <- rowSums(W)
 c <- rowsums[1]
 
@@ -219,18 +222,20 @@ Konvertering til cirkulant model estimater.
 ```{r}
 kappa_est <- c/lam_est
 
-beta_est <- numeric(N/2)
-for (k in 1:(N/2)) {
+n_betas = floor((N-1)/2)
+
+beta_est <- numeric(n_betas)
+for (k in 1:n_betas) {
   beta_est[k] = -(phi_est/c)* W[1,k+1]  # samme
 }
-circ_kernel = gauss_kernel_circ(5, sig_kernel = sigma_max_ll, N)[1,2:(N/2 +1)]
+circ_kernel = gauss_kernel_circ(sig_kernel = sigma_max_ll, N)[1,2:(N/2 +1)]
 ```
 
 
 ```{r}
 # define a fine grid of k’s from 1 to N
-k_grid1 <- seq(1, N/2, length.out = 500) # only need this part later
-k_grid2 <- seq(N/2, N, length.out = 500)
+k_grid1 <- seq(1, n_betas, length.out = 500) # only need this part later
+k_grid2 <- seq(n_betas, N, length.out = 500)
 k_grid = c(k_grid1, k_grid2)
 
 # map to angles in [0,2*pi]
@@ -247,10 +252,7 @@ kernel_cont <- (phi_est/c) * exp(-d_grid^2 / (2 * sigma_max_ll^2))
 
 Plot with true betas and estimated betas from kernel
 ```{r}
-# beta_true <- c(beta1_true, beta2_true, beta3_true, rep(0, N/2 - 3))
-# beta_true <- c(beta1_true, beta2_true, rep(0, N/2 - 2))
-# beta_true <- c(beta1_true, beta2_true, beta3_true, beta4_true, rep(0, N/2 - 4))
-beta_true <- c(betas, rep(0, N/2 - length(betas)))
+beta_true <- c(betas, rep(0, n_betas - length(betas)))
 
 plot(-beta_est, 
      ylim = c(min(0, min(-beta_est)), max(max(-beta_est), -beta_true)),
@@ -269,7 +271,9 @@ legend("topright",
        lty = c(NA, NA, "dashed"),
        lwd = c(1.5, 1.5, 1.5),
        bty = "n",
-       cex = 0.9)
+       inset  = c(-0.1, 0),
+       xpd = TRUE,
+       cex = 0.95)
 ```
 
 
@@ -446,6 +450,10 @@ beta_est
 ```
 
 
+Plot af betaer og gaussian kernel
+
+
+Midpoints as median distance in each bin
 ```{r}
 
 # For each bin label, calculate the median distance of all corresponding (unique) pairs.
@@ -459,7 +467,6 @@ medians_by_bin <- sapply(1:(n_breaks-1), function(k) {
 
 ```
 
-Plot of scaled gaussian kernel and corresponding betas from discretized distances:
 
 ```{r}
 gauss_kernel <- function(x) return(exp(-(x^2)/(2*sig_kernel^2)))
@@ -599,7 +606,7 @@ for (i in 1:nrow(combs)) {
     beta_est_median[k] <- -median(rho_vals_k)
     beta_est_std[k] <- sd(rho_vals_k)
     
-    # theoretical values
+    # theoretical values?
     corr_vals_k <-  apply(unique_indices_bin_k, 1, function(idx) {
       i <- idx[1]
       j <- idx[2]
