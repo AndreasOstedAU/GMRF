@@ -353,20 +353,20 @@ solve_params_analytical <- function(V, p) {
 
 ## Estimates on all the data
 ```{r}
-analytical_ests <- solve_params_analytical(data1, 12)
+analytical_ests <- solve_params_analytical(data1, 11)
 est_num_single <- solve_params_numerical_single(data1)
 #solve_params_numerical(analytical_ests$beta_est, data1)
 
 ```
 
 ```{r}
-plot(1:12, analytical_ests$beta_est, type = 'h', lwd = 1.5, ylab = '', xaxt = 'n', xlab = '')
+plot(1:11, analytical_ests$beta_est, type = 'h', lwd = 1.5, ylab = '', xaxt = 'n', xlab = '')
 points(analytical_ests$beta_est, pch = 20)
 abline(h = 0, lty = 'dashed')
 axis(
   side = 1,
-  at = 1:12,
-  labels = parse(text = paste0("beta[", 1:12, "]")),
+  at = 1:11,
+  labels = parse(text = paste0("beta[", 1:11, "]")),
   las = 1
 )
 ```
